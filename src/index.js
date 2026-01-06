@@ -1,17 +1,25 @@
+// index.js
 import "dotenv/config";
+import { banCommand, handleBan } from "./ban.js";
 import {
   Client,
   GatewayIntentBits,
   Partials,
   REST,
   Routes,
+  ContextMenuCommandBuilder,
+  ApplicationCommandType,
 } from "discord.js";
+
 import { DB } from "./db.js";
 import {
   statsCommand,
   handleStats,
   handleStatsPeriodButton,
-} from "./commands/stats.js";
+} from "./stats.js";
+
+// QUOTE RENDERER (your existing one)
+import { renderQuoteImage } from "./render_quote.js";
 
 // ---------------- ENV ----------------
 
@@ -20,18 +28,13 @@ const clientId = process.env.CLIENT_ID;
 const guildId = process.env.GUILD_ID;
 
 if (!token || !clientId) {
-  throw new Error("Missing DISCORD_TOKEN or CLIENT_ID in .env");
+  throw new Error("Missing DISCORD_TOKEN or CLIENT_ID");
 }
 
 // ---------------- ERROR VISIBILITY ----------------
 
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled promise rejection:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception:", err);
-});
+process.on("unhandledRejection", console.error);
+process.on("uncaughtException", console.error);
 
 // ---------------- CLIENT ----------------
 
@@ -40,34 +43,41 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent, // REQUIRED for quote rendering
   ],
   partials: [Partials.Channel],
 });
+
+// ---------------- COMMAND DEFINITIONS ----------------
+
+// Message context menu: Quote
+const quoteCommand = new ContextMenuCommandBuilder()
+  .setName("Quote")
+  .setType(ApplicationCommandType.Message);
 
 // ---------------- COMMAND REGISTRATION ----------------
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(token);
-  const body = [statsCommand.toJSON()];
+
+  const commands = [
+    statsCommand.toJSON(),
+    quoteCommand.toJSON(),
+    banCommand.toJSON(),
+  ];
 
   if (guildId) {
-    await rest.put(
-      Routes.applicationGuildCommands(clientId, guildId),
-      { body }
-    );
-    console.log(`Slash commands registered (GUILD) for ${guildId}`);
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
+      body: commands,
+    });
+    console.log("Registered GUILD commands");
   } else {
-    await rest.put(
-      Routes.applicationCommands(clientId),
-      { body }
-    );
-    console.log(
-      "Slash commands registered (GLOBAL) — changes may take up to 1 hour"
-    );
+    await rest.put(Routes.applicationCommands(clientId), { body: commands });
+    console.log("Registered GLOBAL commands");
   }
 }
 
-// ---------------- MESSAGE TRACKING ----------------
+// ---------------- MESSAGE TRACKING (STATS) ----------------
 
 client.on("messageCreate", async (message) => {
   try {
@@ -92,7 +102,7 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ---------------- VOICE TRACKING ----------------
+// ---------------- VOICE TRACKING (STATS) ----------------
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
@@ -105,7 +115,6 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const oldChannelId = oldState.channelId;
     const newChannelId = newState.channelId;
 
-    // Join
     if (!oldChannelId && newChannelId) {
       await DB.upsertSession({
         guild_id: guildId,
@@ -116,13 +125,11 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       return;
     }
 
-    // Leave
     if (oldChannelId && !newChannelId) {
       await closeSession(guildId, userId);
       return;
     }
 
-    // Move
     if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
       await closeSession(guildId, userId);
       await DB.upsertSession({
@@ -141,16 +148,12 @@ async function closeSession(guildId, userId) {
   const sess = await DB.getSession(guildId, userId);
   if (!sess) return;
 
-  const now = Date.now();
-  const seconds = Math.max(
-    0,
-    Math.floor((now - sess.started_at_ms) / 1000)
-  );
-
+  const seconds = Math.floor((Date.now() - sess.started_at_ms) / 1000);
   await DB.deleteSession(guildId, userId);
+
   if (seconds <= 0) return;
 
-  const day = DB.utcDayString(now);
+  const day = DB.utcDayString();
 
   await DB.addUserVoice({
     guild_id: guildId,
@@ -167,26 +170,64 @@ async function closeSession(guildId, userId) {
   });
 }
 
-// ---------------- READY ----------------
-
-client.on("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
 // ---------------- INTERACTIONS ----------------
 
 client.on("interactionCreate", async (interaction) => {
   try {
+    // Slash commands
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "stats") {
         await handleStats(interaction);
         return;
       }
+
+      if (interaction.commandName === "ban") {
+        await handleBan(interaction);
+        return;
+      }
     }
 
+    // stats buttons
     if (interaction.isButton()) {
       if (interaction.customId.startsWith("stats:period:")) {
         await handleStatsPeriodButton(interaction);
+        return;
+      }
+    }
+
+    // Quote (message context menu)
+    if (interaction.isMessageContextMenuCommand()) {
+      if (interaction.commandName === "Quote") {
+        // Acknowledge the interaction so Discord doesn't show "interaction failed"
+        await interaction.deferReply({ ephemeral: true });
+
+        const message = interaction.targetMessage;
+
+        const buffer = await renderQuoteImage({
+          message,
+          guild: interaction.guild,
+        });
+
+        const QUOTE_CHANNEL_ID = "1226401843635032074";
+
+        const quoteChannel = await interaction.guild.channels
+          .fetch(QUOTE_CHANNEL_ID)
+          .catch(() => null);
+
+        if (!quoteChannel || !quoteChannel.isTextBased()) {
+          await interaction.editReply({
+            content: "Quote channel not found or not a text channel.",
+          });
+          return;
+        }
+
+        await quoteChannel.send({
+          files: [{ attachment: buffer, name: "quote.png" }],
+        });
+
+        // Quiet confirmation to the person who used the command
+        await interaction.editReply({ content: "Posted quote." });
+
         return;
       }
     }
@@ -201,6 +242,10 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ---------------- STARTUP ----------------
+
+client.once("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
 
 await DB.init();
 await registerCommands();
